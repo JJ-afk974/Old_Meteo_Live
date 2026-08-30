@@ -1,4 +1,4 @@
-name: Collecte météo LFPB
+name: Main
 
 on:
   workflow_dispatch:
