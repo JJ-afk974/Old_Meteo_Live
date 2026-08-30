@@ -3,132 +3,392 @@ import pandas as pd
 import time
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 FICHIER = "poly_live.csv"
 
-# Géographies à récupérer
 VILLES = {
     "new_york": "new-york",
     "miami": "miami",
 }
 
-# J+0 et J+1
-aujourdhui = datetime.now().date()
-DATES = [
-    aujourdhui,
-    aujourdhui + timedelta(days=1),
-]
+TIMEOUT = 10
 
 
-def fetch_poly(slug):
+# ============================================================
+# SESSION HTTP
+# ============================================================
+
+session = requests.Session()
+
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (GitHub Actions Polymarket collector)"
+})
+
+
+# ============================================================
+# CONSTRUCTION DU SLUG
+# ============================================================
+
+def make_slug(city_slug, date):
+    """
+    Construit le slug Polymarket :
+
+    highest-temperature-in-new-york-on-august-30-2026
+    """
+
+    month = date.strftime("%B").lower()
+    day = date.day
+    year = date.year
+
+    return f"highest-temperature-in-{city_slug}-on-{month}-{day}-{year}"
+
+
+# ============================================================
+# RÉCUPÉRATION DE L'ÉVÉNEMENT
+# ============================================================
+
+def fetch_event(slug):
     url = f"https://gamma-api.polymarket.com/events/slug/{slug}"
 
     try:
-        r = requests.get(url, timeout=10)
+        response = session.get(url, timeout=TIMEOUT)
 
-        if r.status_code != 200:
-            print(f"[ERREUR] {slug} -> HTTP {r.status_code}")
+        if response.status_code != 200:
+            print(
+                f"[EVENT] HTTP {response.status_code} "
+                f"pour {slug}"
+            )
             return None
 
-        return r.json()
+        return response.json()
 
     except requests.RequestException as e:
-        print(f"[ERREUR] {slug} -> {e}")
+        print(f"[EVENT] Erreur réseau pour {slug}: {e}")
+        return None
+
+    except ValueError as e:
+        print(f"[EVENT] JSON invalide pour {slug}: {e}")
         return None
 
 
-rows = []
+# ============================================================
+# RÉCUPÉRATION DU CARNET
+# ============================================================
 
-for ville, ville_slug in VILLES.items():
+def fetch_order_book(token_id):
+    url = "https://clob.polymarket.com/book"
 
-    for date in DATES:
+    try:
+        response = session.get(
+            url,
+            params={"token_id": token_id},
+            timeout=TIMEOUT
+        )
 
-        # Format YYYY-MM-DD
-        date_str = date.strftime("%Y-%m-%d")
+        if response.status_code != 200:
+            print(
+                f"[BOOK] HTTP {response.status_code} "
+                f"pour token {token_id}"
+            )
+            return None
 
-        # Exemple :
-        # highest-temperature-in-new-york-on-2026-08-30
-        slug = f"highest-temperature-in-{ville_slug}-on-{date_str}"
+        return response.json()
 
-        print(f"\nRécupération : {ville} | {date_str}")
-        print(f"Slug : {slug}")
+    except requests.RequestException as e:
+        print(f"[BOOK] Erreur réseau pour {token_id}: {e}")
+        return None
 
-        event = fetch_poly(slug)
+    except ValueError as e:
+        print(f"[BOOK] JSON invalide pour {token_id}: {e}")
+        return None
 
-        if event is None:
-            continue
 
-        for market in event.get("markets", []):
+# ============================================================
+# EXTRACTION DU BEST BID / BEST ASK
+# ============================================================
 
-            try:
-                token_ids = json.loads(market["clobTokenIds"])
-                token_yes = token_ids[0]
+def get_best_prices(book):
+    bids = book.get("bids", [])
+    asks = book.get("asks", [])
 
-                book_response = requests.get(
-                    "https://clob.polymarket.com/book",
-                    params={"token_id": token_yes},
-                    timeout=10
-                )
+    # Sur un carnet classique :
+    # best bid = prix le plus élevé
+    # best ask = prix le plus faible
 
-                if book_response.status_code != 200:
+    if bids:
+        best_bid = max(
+            bids,
+            key=lambda x: float(x.get("price", 0))
+        )
+    else:
+        best_bid = {
+            "price": None,
+            "size": None
+        }
+
+    if asks:
+        best_ask = min(
+            asks,
+            key=lambda x: float(x.get("price", 999))
+        )
+    else:
+        best_ask = {
+            "price": None,
+            "size": None
+        }
+
+    return best_bid, best_ask
+
+
+# ============================================================
+# PROGRAMME PRINCIPAL
+# ============================================================
+
+def main():
+
+    # Date actuelle UTC.
+    # Pour un workflow exécuté régulièrement, on veut une date
+    # cohérente et reproductible.
+    maintenant = datetime.now(timezone.utc)
+
+    date_j0 = maintenant.date()
+    date_j1 = date_j0 + timedelta(days=1)
+
+    dates = [
+        ("J+0", date_j0),
+        ("J+1", date_j1),
+    ]
+
+    rows = []
+
+    print("=" * 70)
+    print("COLLECTE POLYMARKET")
+    print("=" * 70)
+    print(f"Date UTC : {maintenant.isoformat()}")
+    print()
+
+    # --------------------------------------------------------
+    # Boucle villes
+    # --------------------------------------------------------
+
+    for ville, ville_slug in VILLES.items():
+
+        # ----------------------------------------------------
+        # Boucle J+0 / J+1
+        # ----------------------------------------------------
+
+        for jour, date in dates:
+
+            slug = make_slug(ville_slug, date)
+
+            print("-" * 70)
+            print(f"Ville : {ville}")
+            print(f"Jour  : {jour}")
+            print(f"Date  : {date}")
+            print(f"Slug  : {slug}")
+
+            # ------------------------------------------------
+            # Event Polymarket
+            # ------------------------------------------------
+
+            event = fetch_event(slug)
+
+            if event is None:
+                print("Aucun événement récupéré.")
+                continue
+
+            markets = event.get("markets", [])
+
+            if not markets:
+                print("Événement trouvé mais aucun market.")
+                continue
+
+            print(f"{len(markets)} markets trouvés.")
+
+            # Timestamp unique pour ce snapshot
+            collecte_le = datetime.now(timezone.utc).isoformat()
+
+            # ------------------------------------------------
+            # Boucle markets
+            # ------------------------------------------------
+
+            for market in markets:
+
+                option = market.get("groupItemTitle")
+
+                if not option:
+                    print("Market sans groupItemTitle, ignoré.")
+                    continue
+
+                # ------------------------------------------------
+                # Tokens
+                # ------------------------------------------------
+
+                try:
+                    token_ids = json.loads(
+                        market.get("clobTokenIds", "[]")
+                    )
+
+                except (json.JSONDecodeError, TypeError):
                     print(
-                        f"[ERREUR BOOK] {ville} | {date_str} | "
-                        f"{market.get('groupItemTitle')} -> "
-                        f"HTTP {book_response.status_code}"
+                        f"Token IDs invalides pour option "
+                        f"{option}"
                     )
                     continue
 
-                book = book_response.json()
+                if not token_ids:
+                    print(
+                        f"Aucun token pour option {option}"
+                    )
+                    continue
 
-                # On conserve la logique de ton code initial
-                best_bid = (
-                    book["bids"][-1]
-                    if book.get("bids")
-                    else {"price": None, "size": None}
-                )
+                # Premier token = YES
+                token_yes = token_ids[0]
 
-                best_ask = (
-                    book["asks"][-1]
-                    if book.get("asks")
-                    else {"price": None, "size": None}
-                )
+                # ------------------------------------------------
+                # Order book
+                # ------------------------------------------------
+
+                book = fetch_order_book(token_yes)
+
+                if book is None:
+                    continue
+
+                best_bid, best_ask = get_best_prices(book)
+
+                # ------------------------------------------------
+                # Ligne CSV
+                # ------------------------------------------------
 
                 rows.append({
                     "ville": ville,
-                    "date": date_str,
-                    "jour": "J+0" if date == aujourdhui else "J+1",
+                    "jour": jour,
+                    "date": str(date),
                     "slug": slug,
-                    "option": market.get("groupItemTitle"),
-                    "bestBid": best_bid["price"],
-                    "bidVolume": best_bid["size"],
-                    "bestAsk": best_ask["price"],
-                    "askVolume": best_ask["size"],
-                    "_collecte_le": datetime.now().isoformat(),
+                    "option": option,
+                    "token_yes": token_yes,
+
+                    "bestBid": best_bid.get("price"),
+                    "bidVolume": best_bid.get("size"),
+
+                    "bestAsk": best_ask.get("price"),
+                    "askVolume": best_ask.get("size"),
+
+                    "_collecte_le": collecte_le,
                 })
 
-            except Exception as e:
                 print(
-                    f"[ERREUR MARKET] {ville} | {date_str} | "
-                    f"{market.get('groupItemTitle')} -> {e}"
+                    f"  {option} | "
+                    f"bid={best_bid.get('price')} | "
+                    f"ask={best_ask.get('price')}"
                 )
 
-            # Petite pause pour éviter d'enchaîner trop rapidement les requêtes
-            time.sleep(0.1)
+                # Petite pause entre les appels API
+                time.sleep(0.1)
 
+    # ========================================================
+    # CRÉATION / SAUVEGARDE DU CSV
+    # ========================================================
 
-# Création du DataFrame
-data = pd.DataFrame(rows)
+    colonnes = [
+        "ville",
+        "jour",
+        "date",
+        "slug",
+        "option",
+        "token_yes",
+        "bestBid",
+        "bidVolume",
+        "bestAsk",
+        "askVolume",
+        "_collecte_le",
+    ]
 
-if not data.empty:
-    data.to_csv(
+    data = pd.DataFrame(rows, columns=colonnes)
+
+    # --------------------------------------------------------
+    # IMPORTANT :
+    # on crée TOUJOURS le fichier, même si rows est vide.
+    # Cela évite :
+    #
+    # fatal: pathspec 'poly_live.csv' did not match any files
+    # --------------------------------------------------------
+
+    if data.empty:
+
+        print()
+        print("=" * 70)
+        print("AUCUNE DONNÉE RÉCUPÉRÉE")
+        print("=" * 70)
+
+        # Si le fichier n'existe pas encore,
+        # on crée un CSV vide avec les bonnes colonnes.
+        if not os.path.exists(FICHIER):
+            data.to_csv(
+                FICHIER,
+                index=False
+            )
+            print(f"Fichier vide créé : {FICHIER}")
+        else:
+            print(
+                f"{FICHIER} existe déjà, "
+                "aucune modification effectuée."
+            )
+
+        return
+
+    # ========================================================
+    # AJOUT À L'HISTORIQUE
+    # ========================================================
+
+    if os.path.exists(FICHIER):
+
+        try:
+            ancien = pd.read_csv(FICHIER)
+
+            data_final = pd.concat(
+                [ancien, data],
+                ignore_index=True
+            )
+
+        except Exception as e:
+
+            print(
+                f"Impossible de lire {FICHIER}: {e}"
+            )
+
+            data_final = data
+
+    else:
+
+        data_final = data
+
+    # --------------------------------------------------------
+    # Sauvegarde
+    # --------------------------------------------------------
+
+    data_final.to_csv(
         FICHIER,
-        mode="a",
-        header=not os.path.exists(FICHIER),
         index=False
     )
 
-    print(f"\n{len(data)} lignes enregistrées dans {FICHIER}")
+    print()
+    print("=" * 70)
+    print("COLLECTE TERMINÉE")
+    print("=" * 70)
+    print(f"Nouvelles lignes : {len(data)}")
+    print(f"Total CSV        : {len(data_final)}")
+    print(f"Fichier          : {FICHIER}")
 
-else:
-    print("\nAucune donnée récupérée.")
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    main()
