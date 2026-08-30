@@ -10,8 +10,18 @@ FICHIER = "poly_live.csv"
 # IMPORTANT :
 # Polymarket utilise "nyc" et non "new-york"
 VILLES = {
-    "new_york": "nyc",
-    "miami": "miami",
+    "New york": "nyc",
+    "Miami": "miami",
+    "Austin": "austin",
+    "Dallas": "dallas",
+    "Denver": "denver",
+    "Chicago": "chicago",
+    "Houston": "houston",
+    "Seattle": "seattle",
+    "Atlanta": "atlanta",
+    "Los Angeles": "los-angeles",
+    "San Francisco": "san-francisco",
+    
 }
 
 TYPES_TEMPERATURE = {
